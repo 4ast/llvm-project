@@ -75,6 +75,10 @@ BPFTargetLowering::BPFTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::STACKSAVE, MVT::Other, Expand);
   setOperationAction(ISD::STACKRESTORE, MVT::Other, Expand);
 
+  // Handle address space casts between mixed sized pointers.
+  setOperationAction(ISD::ADDRSPACECAST, MVT::i32, Custom);
+  setOperationAction(ISD::ADDRSPACECAST, MVT::i64, Custom);
+
   // Set unsupported atomic operations as Custom so
   // we can emit better error messages than fatal error
   // from selectiondag.
@@ -147,6 +151,8 @@ BPFTargetLowering::BPFTargetLowering(const TargetMachine &TM,
       setLoadExtAction(ISD::SEXTLOAD, VT, MVT::i32, Expand);
     }
   }
+
+  setTargetDAGCombine({ISD::LOAD, ISD::STORE});
 
   setBooleanContents(ZeroOrOneBooleanContent);
 
@@ -271,6 +277,30 @@ BPFTargetLowering::getRegForInlineAsmConstraint(const TargetRegisterInfo *TRI,
   return TargetLowering::getRegForInlineAsmConstraint(TRI, Constraint, VT);
 }
 
+static SDValue LowerADDRSPACECAST(SDValue Op, SelectionDAG &DAG) {
+  SDLoc dl(Op);
+  SDValue Src = Op.getOperand(0);
+  MVT DstVT = Op.getSimpleValueType();
+
+  AddrSpaceCastSDNode *N = cast<AddrSpaceCastSDNode>(Op.getNode());
+  unsigned SrcAS = N->getSrcAddressSpace();
+
+  assert(SrcAS != N->getDestAddressSpace() &&
+         "addrspacecast must be between different address spaces");
+
+  if (SrcAS == 271 && DstVT == MVT::i64) {
+    Op = DAG.getNode(ISD::ZERO_EXTEND, dl, DstVT, Src);
+  } else if (DstVT == MVT::i64) {
+    Op = DAG.getNode(ISD::SIGN_EXTEND, dl, DstVT, Src);
+  } else if (DstVT == MVT::i32) {
+    Op = DAG.getNode(ISD::TRUNCATE, dl, DstVT, Src);
+  } else {
+    report_fatal_error("Bad address space in addrspacecast");
+  }
+  return Op;
+}
+
+
 void BPFTargetLowering::ReplaceNodeResults(
   SDNode *N, SmallVectorImpl<SDValue> &Results, SelectionDAG &DAG) const {
   const char *Msg;
@@ -289,6 +319,11 @@ void BPFTargetLowering::ReplaceNodeResults(
     else
       Msg = "unsupported atomic operation, please use 64 bit version";
     break;
+  case ISD::ADDRSPACECAST: {
+    SDValue V = LowerADDRSPACECAST(SDValue(N, 0), DAG);
+    Results.push_back(V);
+    return;
+  }
   }
 
   SDLoc DL(N);
@@ -307,9 +342,71 @@ SDValue BPFTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
     return LowerGlobalAddress(Op, DAG);
   case ISD::SELECT_CC:
     return LowerSELECT_CC(Op, DAG);
+  case ISD::ADDRSPACECAST:
+    return LowerADDRSPACECAST(Op, DAG);
   case ISD::DYNAMIC_STACKALLOC:
     report_fatal_error("unsupported dynamic stack allocation");
   }
+}
+
+static SDValue combineLoad(SDNode *N, SelectionDAG &DAG,
+                           TargetLowering::DAGCombinerInfo &DCI) {
+  LoadSDNode *Ld = cast<LoadSDNode>(N);
+  EVT RegVT = Ld->getValueType(0);
+  SDLoc dl(Ld);
+  const TargetLowering &TLI = DAG.getTargetLoweringInfo();
+
+  // Cast ptr32 and ptr64 pointers to the default address space before a load.
+  unsigned AddrSpace = Ld->getAddressSpace();
+  if (AddrSpace == 271) {
+    MVT PtrVT = TLI.getPointerTy(DAG.getDataLayout());
+    if (PtrVT != Ld->getBasePtr().getSimpleValueType()) {
+      SDValue Cast =
+          DAG.getAddrSpaceCast(dl, PtrVT, Ld->getBasePtr(), AddrSpace, 0);
+      return DAG.getLoad(RegVT, dl, Ld->getChain(), Cast, Ld->getPointerInfo(),
+                         Ld->getOriginalAlign(),
+                         Ld->getMemOperand()->getFlags());
+    }
+  }
+
+  return SDValue();
+}
+
+static SDValue combineStore(SDNode *N, SelectionDAG &DAG,
+                            TargetLowering::DAGCombinerInfo &DCI) {
+  StoreSDNode *St = cast<StoreSDNode>(N);
+  SDLoc dl(St);
+  SDValue StoredVal = St->getValue();
+  const TargetLowering &TLI = DAG.getTargetLoweringInfo();
+
+  // Cast ptr32 and ptr64 pointers to the default address space before a store.
+  unsigned AddrSpace = St->getAddressSpace();
+  if (AddrSpace == 271) {
+    MVT PtrVT = TLI.getPointerTy(DAG.getDataLayout());
+    if (PtrVT != St->getBasePtr().getSimpleValueType()) {
+      SDValue Cast =
+          DAG.getAddrSpaceCast(dl, PtrVT, St->getBasePtr(), AddrSpace, 0);
+      return DAG.getTruncStore(St->getChain(), dl, StoredVal, Cast,
+                               St->getMemoryVT(), St->getMemOperand());
+    }
+  }
+
+  return SDValue();
+}
+
+SDValue BPFTargetLowering::PerformDAGCombine(SDNode *N,
+                                             DAGCombinerInfo &DCI) const {
+  SelectionDAG &DAG = DCI.DAG;
+  switch (N->getOpcode()) {
+  default:
+    break;
+  case ISD::LOAD:
+    return combineLoad(N, DAG, DCI);
+  case ISD::STORE:
+    return combineStore(N, DAG, DCI);
+  }
+
+  return SDValue();
 }
 
 // Calling Convention Implementation

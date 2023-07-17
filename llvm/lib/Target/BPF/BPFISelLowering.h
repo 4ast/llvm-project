@@ -106,6 +106,8 @@ private:
   void ReplaceNodeResults(SDNode *N, SmallVectorImpl<SDValue> &Results,
                           SelectionDAG &DAG) const override;
 
+  SDValue PerformDAGCombine(SDNode *N, DAGCombinerInfo &DCI) const override;
+
   EVT getOptimalMemOpType(const MemOp &Op,
                           const AttributeList &FuncAttributes) const override {
     return Op.size() >= 8 ? MVT::i64 : MVT::i32;
